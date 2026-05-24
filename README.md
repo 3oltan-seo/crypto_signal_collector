@@ -1,1 +1,115 @@
-# crypto_signal_collector
+# Bybit futures scanner system
+
+## Workflow
+
+1. Run:
+
+```bash
+python3 scanner.py
+```
+
+2. Open `scanner_results.xlsx`.
+3. Put `yes` in `selected` for signals where you placed limit orders.
+4. Optionally write a note in `manual_comment`.
+5. Save the Excel file.
+6. Run:
+
+```bash
+python3 sync_selected_signals.py
+```
+
+7. After trades close on Bybit, run:
+
+```bash
+python3 sync_bybit_trades.py
+```
+
+8. If you already have old rows in `trades_log.csv`, run once:
+
+```bash
+python3 enrich_existing_trades.py
+```
+
+## Files
+
+- `scanner.py` — creates current long/short signals, appends all signals to `signals_log.csv`, and writes `scanner_results.xlsx`.
+- `sync_selected_signals.py` — saves rows marked `selected=yes` into `selected_signals.csv`.
+- `sync_bybit_trades.py` — pulls closed PnL from Bybit, matches trades to signals, and enriches `trades_log.csv`.
+- `enrich_existing_trades.py` — enriches already existing `trades_log.csv` from local signal logs.
+
+## Important behavior
+
+- `scanner_results.xlsx` is a temporary current-output file and can be overwritten.
+- Before overwriting, `scanner.py` tries to archive selected rows from the previous `scanner_results.xlsx`.
+- `signals_log.csv`, `selected_signals.csv`, and `trades_log.csv` are persistent logs.
+- Matching is strict by default: a signal must exist before the trade entry time.
+- `ALLOW_WEAK_MATCH_AFTER_ENTRY = False` prevents accidental learning from signals that appeared after a trade was already opened.
+- Long and short signals are both shown in every BTC regime.
+- BTC regime changes scoring, not visibility: bearish BTC penalizes longs and boosts shorts; supportive BTC boosts longs and penalizes shorts.
+- `scanner_results.xlsx` shows separate top candidates per side via `TOP_N_PER_SIDE`.
+- Bybit closed `Sell` is treated as closing a long; closed `Buy` is treated as closing a short.
+- `sync_bybit_trades.py` also checks Bybit order/execution history for liquidation/ADL/admin-close markers. If found, `result_type` becomes `LIQUIDATION` instead of `SL_or_near_SL`.
+- Manual liquidation corrections are preserved. If a row already has `result_type=LIQUIDATION`, `is_liquidation=TRUE`, `liquidation_flag_source=manual_user_correction`, or a liquidation note in `comment`, enrichment and sync will not downgrade it back to `BE` or `SL_or_near_SL`.
+- The scanner includes a Python adaptation of the Smart Money Concepts Pine script:
+  - confirmed internal/swing BOS and CHoCH;
+  - premium/discount/equilibrium zone;
+  - recent bullish/bearish fair value gaps;
+  - SMC score columns: `smc_score_delta`, `smc_bias`, `smc_event`, `smc_zone`, `smc_reason`.
+
+This is not a 1:1 visual TradingView port. Drawing-only objects such as boxes, lines, and labels are converted into numeric scanner factors.
+
+## Market-regime context
+
+The scanner prints a market-regime summary in the terminal at the start of each run. These fields do **not** change `score` yet and are no longer repeated in every row of `scanner_results.xlsx`.
+
+The same snapshot is saved once per run to `market_regime_log.csv`:
+
+- `created_at`
+- `market_regime`
+- `market_bias`
+- `market_summary`
+- `fear_greed_value`
+- `fear_greed_status`
+- `altseason_index`
+- `altseason_status`
+- `btc_dominance`
+- `eth_dominance`
+- `cycle_mvrv_z`
+- `cycle_puell`
+- `cycle_mayer`
+- `cycle_cbbi`
+- `market_reason`
+
+Data sources:
+
+- Fear & Greed: public Alternative.me API.
+- BTC/ETH dominance: public CoinGecko global API.
+- CMC cycle indicators: best-effort scrape of CoinMarketCap cycle page. If unavailable, fields stay blank.
+
+Optional manual override:
+
+1. Copy `market_regime_manual.example.json` to `market_regime_manual.json`.
+2. Fill any values manually.
+3. `scanner.py` will use your manual values when available.
+
+Terminal output includes a human-readable market summary, for example:
+
+```text
+Market summary: Рынок выглядит скорее risk-off: short-сигналы приоритетнее, а long по альтам требуют сильного подтверждения и меньшего размера.
+```
+
+## Requirements
+
+```bash
+python3 -m pip install pybit pandas python-dotenv tabulate openpyxl
+```
+
+Your `.env` file should contain:
+
+```env
+BYBIT_API_KEY=your_key
+BYBIT_API_SECRET=your_secret
+BYBIT_TESTNET=false
+```
+
+Do not share `.env` or API secrets.
