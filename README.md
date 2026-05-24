@@ -1,0 +1,1 @@
+# crypto_signal_collector
