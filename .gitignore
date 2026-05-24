@@ -29,3 +29,6 @@ venv/
 
 # macOS
 .DS_Store
+
+# Auto-pull local logs
+sync/*.log
