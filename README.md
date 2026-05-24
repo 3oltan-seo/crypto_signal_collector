@@ -30,18 +30,28 @@ python3 sync_bybit_trades.py
 python3 enrich_existing_trades.py
 ```
 
+9. Build analytical trade episodes:
+
+```bash
+python3 build_trade_episodes.py
+```
+
+This creates `trade_episodes.csv`, where one row means one scanner trading idea, not one Bybit closing execution.
+
 ## Files
 
 - `scanner.py` — creates current long/short signals, appends all signals to `signals_log.csv`, and writes `scanner_results.xlsx`.
 - `sync_selected_signals.py` — saves rows marked `selected=yes` into `selected_signals.csv`.
 - `sync_bybit_trades.py` — pulls closed PnL from Bybit, matches trades to signals, and enriches `trades_log.csv`.
 - `enrich_existing_trades.py` — enriches already existing `trades_log.csv` from local signal logs.
+- `build_trade_episodes.py` — groups raw `trades_log.csv` rows into analytical trade episodes in `trade_episodes.csv`.
 
 ## Important behavior
 
 - `scanner_results.xlsx` is a temporary current-output file and can be overwritten.
 - Before overwriting, `scanner.py` tries to archive selected rows from the previous `scanner_results.xlsx`.
 - `signals_log.csv`, `selected_signals.csv`, and `trades_log.csv` are persistent logs.
+- `trade_episodes.csv` is an analytical derived file. It can be regenerated from `trades_log.csv`, `signals_log.csv`, and `selected_signals.csv`.
 - Matching is strict by default: a signal must exist before the trade entry time.
 - `ALLOW_WEAK_MATCH_AFTER_ENTRY = False` prevents accidental learning from signals that appeared after a trade was already opened.
 - Long and short signals are both shown in every BTC regime.
@@ -50,6 +60,11 @@ python3 enrich_existing_trades.py
 - Bybit closed `Sell` is treated as closing a long; closed `Buy` is treated as closing a short.
 - `sync_bybit_trades.py` also checks Bybit order/execution history for liquidation/ADL/admin-close markers. If found, `result_type` becomes `LIQUIDATION` instead of `SL_or_near_SL`.
 - Manual liquidation corrections are preserved. If a row already has `result_type=LIQUIDATION`, `is_liquidation=TRUE`, `liquidation_flag_source=manual_user_correction`, or a liquidation note in `comment`, enrichment and sync will not downgrade it back to `BE` or `SL_or_near_SL`.
+- `build_trade_episodes.py` keeps raw executions separate from analytical results:
+  - `PARTIAL_TP` means Bybit closed part of the position by partial take-profit.
+  - `PROTECTED_BE` means the stop was likely moved to breakeven or small profit after the trade moved in your favor.
+  - `TP1_THEN_PROTECTED_BE` means the idea first took partial profit and then the remainder closed around protected breakeven.
+  - `LIQUIDATION` always overrides mathematical BE/SL classification when liquidation markers are present.
 - The scanner includes a Python adaptation of the Smart Money Concepts Pine script:
   - confirmed internal/swing BOS and CHoCH;
   - premium/discount/equilibrium zone;
