@@ -11,6 +11,7 @@ selected_signals.csv
 market_regime_log.csv
 scanner_results*.csv
 scanner_results*.xlsx
+stale_positions*.csv
 
 # Local manual overrides
 market_regime_manual.json

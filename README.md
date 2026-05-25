@@ -18,19 +18,27 @@ python3 scanner.py
 python3 sync_selected_signals.py
 ```
 
-7. After trades close on Bybit, run:
+7. Between opening and closing, you can batch-check for stale swing positions at any time. This is read-only and never closes anything:
+
+```bash
+python3 check_stale_positions.py
+```
+
+It prints a table of open Bybit linear positions, classifies each by age (`OK` / `WATCH` / `REVIEW` / `TIME_STOP_REVIEW` / `UNKNOWN_AGE`), matches them against local scanner signals, and writes `stale_positions.csv`. Useful CLI options: `--only-stale`, `--watch-days`, `--review-days`, `--time-stop-days`, `--no-save`, `--csv-output PATH`, `--json`.
+
+8. After trades close on Bybit, run:
 
 ```bash
 python3 sync_bybit_trades.py
 ```
 
-8. If you already have old rows in `trades_log.csv`, run once:
+9. If you already have old rows in `trades_log.csv`, run once:
 
 ```bash
 python3 enrich_existing_trades.py
 ```
 
-9. Build analytical trade episodes:
+10. Build analytical trade episodes:
 
 ```bash
 python3 build_trade_episodes.py
@@ -42,6 +50,7 @@ This creates `trade_episodes.csv`, where one row means one scanner trading idea,
 
 - `scanner.py` — creates current long/short signals, appends all signals to `signals_log.csv`, and writes `scanner_results.xlsx`.
 - `sync_selected_signals.py` — saves rows marked `selected=yes` into `selected_signals.csv`.
+- `check_stale_positions.py` — read-only check of current open Bybit linear positions; classifies each by age and matches against scanner signals. Never closes orders. Saves `stale_positions.csv`.
 - `sync_bybit_trades.py` — pulls closed PnL from Bybit, matches trades to signals, and enriches `trades_log.csv`.
 - `enrich_existing_trades.py` — enriches already existing `trades_log.csv` from local signal logs.
 - `build_trade_episodes.py` — groups raw `trades_log.csv` rows into analytical trade episodes in `trade_episodes.csv`.
