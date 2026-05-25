@@ -8,6 +8,7 @@ place, cancel, or close any orders.
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -200,14 +201,74 @@ def bybit_side_to_position_side(bybit_side):
     return s or ""
 
 
+AUTH_ERROR_PATTERNS = [
+    (re.compile(r"\bErrCode:\s*10004\b", re.IGNORECASE), "10004 signature error"),
+    (re.compile(r"\berror sign\b", re.IGNORECASE), "signature error"),
+    (re.compile(r"\bsignature\b", re.IGNORECASE), "signature error"),
+    (re.compile(r"\bErrCode:\s*10003\b", re.IGNORECASE), "10003 invalid api key"),
+    (re.compile(r"\binvalid api[- ]?key\b", re.IGNORECASE), "invalid api key"),
+    (re.compile(r"\bErrCode:\s*10005\b", re.IGNORECASE), "10005 permission denied"),
+    (re.compile(r"\bpermission denied\b", re.IGNORECASE), "permission denied"),
+    (re.compile(r"\bErrCode:\s*10002\b", re.IGNORECASE), "10002 timestamp/expired"),
+    (re.compile(r"\bexpired\b", re.IGNORECASE), "expired timestamp"),
+    (re.compile(r"\bunauthorized\b", re.IGNORECASE), "unauthorized"),
+]
+
+
+def classify_error(message):
+    """Return short tag for known auth/signature issues, or None."""
+    if not message:
+        return None
+    for pattern, tag in AUTH_ERROR_PATTERNS:
+        if pattern.search(message):
+            return tag
+    return None
+
+
+def print_auth_troubleshooting():
+    """Print bilingual actionable hints for ErrCode 10004 / auth failures."""
+    print("", file=sys.stderr)
+    print("[hint] Bybit auth/signature failure (ErrCode 10004 и подобные). Проверьте:",
+          file=sys.stderr)
+    print("  - BYBIT_API_KEY и BYBIT_API_SECRET соответствуют одной и той же паре "
+          "(key/secret mismatch).",
+          file=sys.stderr)
+    print("  - Ключ создан как System-generated (HMAC), а не Self-generated (RSA). "
+          "pybit ждёт HMAC.",
+          file=sys.stderr)
+    print("  - В .env нет скрытых пробелов, кавычек, переносов строк или BOM "
+          "(hidden spaces/quotes/newlines).",
+          file=sys.stderr)
+    print("  - BYBIT_TESTNET соответствует среде, где создан ключ "
+          "(testnet vs mainnet).",
+          file=sys.stderr)
+    print("  - Ключ не удалён, не истёк и не отозван на Bybit.",
+          file=sys.stderr)
+    print("  - У ключа включены права на чтение Derivatives/Unified Trading "
+          "(read positions).",
+          file=sys.stderr)
+    print("  - Системное время не уехало (если используется свой timestamp).",
+          file=sys.stderr)
+    print("  Run with --debug-auth-env для безопасной диагностики (без секретов).",
+          file=sys.stderr)
+
+
 def fetch_open_positions(session):
-    """Fetch all open linear positions across settle coins. Returns list of dicts."""
+    """Fetch all open linear positions across settle coins.
+
+    Returns (positions, status_by_settle) where status_by_settle maps each
+    settle coin to a dict {"ok": bool, "error": str|None, "tag": str|None}.
+    """
     positions = []
     seen_keys = set()
+    status_by_settle = {}
 
     settle_coins = ["USDT", "USDC"]
     for settle in settle_coins:
         cursor = ""
+        settle_ok = False
+        settle_error = None
+        settle_tag = None
         while True:
             kwargs = {
                 "category": "linear",
@@ -219,9 +280,23 @@ def fetch_open_positions(session):
             try:
                 response = session.get_positions(**kwargs)
             except Exception as exc:
-                print(f"[warn] get_positions({settle}) failed: {exc}", file=sys.stderr)
+                msg = str(exc)
+                settle_error = msg
+                settle_tag = classify_error(msg)
+                print(f"[warn] get_positions({settle}) failed: {msg}", file=sys.stderr)
                 break
 
+            ret_code = response.get("retCode")
+            ret_msg = response.get("retMsg") or ""
+            if ret_code not in (0, None):
+                combined = f"retCode={ret_code} retMsg={ret_msg}"
+                settle_error = combined
+                settle_tag = classify_error(combined) or classify_error(ret_msg)
+                print(f"[warn] get_positions({settle}) returned error: {combined}",
+                      file=sys.stderr)
+                break
+
+            settle_ok = True
             result = response.get("result") or {}
             items = result.get("list") or []
             for item in items:
@@ -239,7 +314,67 @@ def fetch_open_positions(session):
             if not cursor:
                 break
 
-    return positions
+        status_by_settle[settle] = {
+            "ok": settle_ok,
+            "error": settle_error,
+            "tag": settle_tag,
+        }
+
+    return positions, status_by_settle
+
+
+def mask_value(value):
+    """Return masked representation: length + prefix/suffix, never the full value."""
+    if value is None:
+        return "<missing>"
+    if value == "":
+        return "<empty>"
+    length = len(value)
+    if length <= 8:
+        return f"len={length} value=<too short to show prefix>"
+    return f"len={length} prefix={value[:4]}... suffix=...{value[-2:]}"
+
+
+def looks_quoted(value):
+    if not value:
+        return False
+    if len(value) < 2:
+        return False
+    first, last = value[0], value[-1]
+    return (first == last) and first in ('"', "'")
+
+
+def has_whitespace_issues(value):
+    if value is None:
+        return False
+    return value != value.strip() or "\n" in value or "\r" in value
+
+
+def print_auth_env_debug():
+    """Print masked diagnostics about BYBIT_* env vars. Never prints full values."""
+    raw_key = os.environ.get("BYBIT_API_KEY")
+    raw_secret = os.environ.get("BYBIT_API_SECRET")
+    raw_testnet = os.environ.get("BYBIT_TESTNET")
+
+    print("[debug-auth-env] Masked diagnostics (no secrets printed):",
+          file=sys.stderr)
+    print(f"  BYBIT_API_KEY: present={raw_key is not None}", file=sys.stderr)
+    if raw_key is not None:
+        print(f"    {mask_value(raw_key)}", file=sys.stderr)
+        print(f"    looks_quoted={looks_quoted(raw_key)} "
+              f"whitespace_issues={has_whitespace_issues(raw_key)}",
+              file=sys.stderr)
+    print(f"  BYBIT_API_SECRET: present={raw_secret is not None}", file=sys.stderr)
+    if raw_secret is not None:
+        length = len(raw_secret)
+        print(f"    len={length}", file=sys.stderr)
+        print(f"    looks_quoted={looks_quoted(raw_secret)} "
+              f"whitespace_issues={has_whitespace_issues(raw_secret)}",
+              file=sys.stderr)
+    testnet_norm = (raw_testnet or "").strip().lower()
+    print(f"  BYBIT_TESTNET: raw_present={raw_testnet is not None} "
+          f"normalized={'true' if testnet_norm == 'true' else 'false'}",
+          file=sys.stderr)
 
 
 def extract_position_dt(item):
@@ -403,6 +538,9 @@ def parse_args():
                         help="Only show WATCH/REVIEW/TIME_STOP_REVIEW/UNKNOWN_AGE rows.")
     parser.add_argument("--json", action="store_true",
                         help="Also print rows as JSON to stdout.")
+    parser.add_argument("--debug-auth-env", action="store_true",
+                        help="Print masked diagnostics about BYBIT_* env vars "
+                             "(no secrets shown).")
     return parser.parse_args()
 
 
@@ -418,6 +556,9 @@ def main():
     api_secret = os.getenv("BYBIT_API_SECRET")
     testnet = os.getenv("BYBIT_TESTNET", "false").strip().lower() == "true"
 
+    if args.debug_auth_env:
+        print_auth_env_debug()
+
     if not api_key or not api_secret:
         print("Missing BYBIT_API_KEY or BYBIT_API_SECRET in .env", file=sys.stderr)
         sys.exit(1)
@@ -425,7 +566,40 @@ def main():
     session = HTTP(testnet=testnet, api_key=api_key, api_secret=api_secret)
 
     signals_df = load_signals()
-    items = fetch_open_positions(session)
+    items, settle_status = fetch_open_positions(session)
+
+    ok_settles = [s for s, st in settle_status.items() if st["ok"]]
+    failed_settles = [s for s, st in settle_status.items() if not st["ok"]]
+
+    if not ok_settles and failed_settles:
+        print("", file=sys.stderr)
+        print(f"[error] All Bybit get_positions calls failed "
+              f"({', '.join(failed_settles)}). Open positions are UNKNOWN, "
+              f"not zero.",
+              file=sys.stderr)
+        auth_failure = False
+        for settle in failed_settles:
+            st = settle_status[settle]
+            tag = st.get("tag")
+            err = st.get("error") or ""
+            print(f"  - {settle}: {err}"
+                  + (f"  [{tag}]" if tag else ""),
+                  file=sys.stderr)
+            if tag:
+                auth_failure = True
+        if auth_failure:
+            print_auth_troubleshooting()
+            if not args.debug_auth_env:
+                print("  Tip: rerun with --debug-auth-env to inspect env vars "
+                      "safely.",
+                      file=sys.stderr)
+        sys.exit(2)
+
+    if failed_settles:
+        print(f"[warn] Partial failure: settle coins failed = "
+              f"{', '.join(failed_settles)}; succeeded = "
+              f"{', '.join(ok_settles)}. Results may be incomplete.",
+              file=sys.stderr)
 
     now = datetime.now(timezone.utc)
     rows = []

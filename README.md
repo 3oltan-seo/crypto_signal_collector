@@ -137,3 +137,26 @@ BYBIT_TESTNET=false
 ```
 
 Do not share `.env` or API secrets.
+
+## Troubleshooting
+
+### Bybit `ErrCode: 10004` "Error sign, please check your signature generation algorithm"
+
+`check_stale_positions.py` and other Bybit-calling scripts will print this warning when authentication fails. If **all** `get_positions` calls fail, the script now exits non-zero instead of misleadingly printing `Open positions found: 0`.
+
+Likely causes:
+
+- **Key/secret mismatch** — `BYBIT_API_KEY` and `BYBIT_API_SECRET` are not from the same key pair (e.g. secret copied from a different key).
+- **RSA key used instead of HMAC** — `pybit` expects a **System-generated (HMAC)** key. If you created a **Self-generated (RSA)** key on Bybit, signing will fail. Re-create as System-generated.
+- **Hidden characters in `.env`** — stray spaces, surrounding quotes (`"..."` / `'...'`), trailing newlines, or a BOM in the API key / secret value. Re-paste cleanly without quotes.
+- **Wrong testnet flag** — `BYBIT_TESTNET=true` while the key was created on mainnet, or vice versa. The flag must match the environment where the key was issued.
+- **Old / deleted / expired key** — keys can be deleted or auto-expire on Bybit; the secret then no longer validates. Issue a new key.
+- **Insufficient permissions** — the key exists but does not have read access for **Derivatives / Unified Trading positions**. Enable the right permissions on Bybit.
+
+Safe diagnostics (no secrets printed):
+
+```bash
+python3 check_stale_positions.py --debug-auth-env
+```
+
+This prints whether `BYBIT_API_KEY` / `BYBIT_API_SECRET` are present, their lengths, whether they look wrapped in quotes, whether they contain trailing whitespace or newlines, and the normalized `BYBIT_TESTNET` value. The full key and secret are **never** printed.
