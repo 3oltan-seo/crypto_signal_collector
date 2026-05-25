@@ -167,8 +167,12 @@ def load_signals():
 def find_matching_signal(symbol, side, position_dt, signals_df):
     """Pick the latest signal before position_dt for matching symbol+side.
 
-    If no position_dt is known, return the most recent signal overall for
-    that symbol+side.
+    If no candidate exists at or before position_dt (or position_dt is
+    missing / unreliable), fall back to the most recent signal overall for
+    that symbol+side. Returning the latest candidate even when it is newer
+    than position_dt is intentional: Bybit's position createdTime is often
+    an old technical timestamp for the position slot, not the real open
+    time, so a strict position_dt cutoff would miss the actual signal.
     """
     if signals_df.empty:
         return None
@@ -399,7 +403,11 @@ def classify_status(age_days, watch_days, review_days, time_stop_days):
     return "TIME_STOP_REVIEW", "Past time-stop window — review manually for close."
 
 
-def build_row(item, signals_df, watch_days, review_days, time_stop_days, now):
+POSITION_TS_TOLERANCE_HOURS = 12.0
+
+
+def build_row(item, signals_df, watch_days, review_days, time_stop_days, now,
+              prefer_signal_age=False):
     symbol = item.get("symbol", "")
     bybit_side = item.get("side", "")
     side = bybit_side_to_position_side(bybit_side)
@@ -427,7 +435,20 @@ def build_row(item, signals_df, watch_days, review_days, time_stop_days, now):
 
     age_days = None
     age_basis = ""
-    if position_dt is not None:
+    tolerance_seconds = POSITION_TS_TOLERANCE_HOURS * 3600.0
+
+    if prefer_signal_age and signal_created_dt is not None:
+        age_days = (now - signal_created_dt).total_seconds() / 86400.0
+        age_basis = "signal_created_at_forced"
+    elif position_dt is not None and signal_created_dt is not None:
+        delta_seconds = (signal_created_dt - position_dt).total_seconds()
+        if delta_seconds > tolerance_seconds:
+            age_days = (now - signal_created_dt).total_seconds() / 86400.0
+            age_basis = "signal_created_at_position_ts_unreliable"
+        else:
+            age_days = (now - position_dt).total_seconds() / 86400.0
+            age_basis = "position_created_at"
+    elif position_dt is not None:
         age_days = (now - position_dt).total_seconds() / 86400.0
         age_basis = "position_created_at"
     elif signal_created_dt is not None:
@@ -541,6 +562,12 @@ def parse_args():
     parser.add_argument("--debug-auth-env", action="store_true",
                         help="Print masked diagnostics about BYBIT_* env vars "
                              "(no secrets shown).")
+    parser.add_argument("--prefer-signal-age", action="store_true",
+                        help="When a matching scanner signal is found, always "
+                             "use its created_at as the age basis instead of "
+                             "the Bybit position createdTime. Useful when "
+                             "Bybit returns an old technical timestamp for "
+                             "the position slot.")
     return parser.parse_args()
 
 
@@ -605,7 +632,8 @@ def main():
     rows = []
     for item in items:
         row = build_row(item, signals_df, args.watch_days, args.review_days,
-                        args.time_stop_days, now)
+                        args.time_stop_days, now,
+                        prefer_signal_age=args.prefer_signal_age)
         if row is not None:
             rows.append(row)
 

@@ -24,7 +24,14 @@ python3 sync_selected_signals.py
 python3 check_stale_positions.py
 ```
 
-It prints a table of open Bybit linear positions, classifies each by age (`OK` / `WATCH` / `REVIEW` / `TIME_STOP_REVIEW` / `UNKNOWN_AGE`), matches them against local scanner signals, and writes `stale_positions.csv`. Useful CLI options: `--only-stale`, `--watch-days`, `--review-days`, `--time-stop-days`, `--no-save`, `--csv-output PATH`, `--json`.
+It prints a table of open Bybit linear positions, classifies each by age (`OK` / `WATCH` / `REVIEW` / `TIME_STOP_REVIEW` / `UNKNOWN_AGE`), matches them against local scanner signals, and writes `stale_positions.csv`. Useful CLI options: `--only-stale`, `--watch-days`, `--review-days`, `--time-stop-days`, `--no-save`, `--csv-output PATH`, `--json`, `--prefer-signal-age`.
+
+`TIME_STOP_REVIEW` is advisory only — the script never closes positions. Treat it as "go look at this manually," not as an automated exit signal.
+
+Bybit's position `createdTime` is sometimes an old technical timestamp tied to the position slot/record rather than the actual open time, which can produce nonsense ages like 800+ days for a position you opened today. The script defends against this in two ways:
+
+- **Automatic fallback (default)**: when a scanner signal is matched and the Bybit position timestamp is older than the matched signal's `created_at` by more than 12 hours, the script switches the age basis to the signal's `created_at` and records `age_basis = signal_created_at_position_ts_unreliable` in the report.
+- **Force signal age**: pass `--prefer-signal-age` to always use the matched signal's `created_at` when a match exists. The basis is recorded as `signal_created_at_forced`. Useful if you trust scanner timestamps more than Bybit's position metadata for your workflow.
 
 8. After trades close on Bybit, run:
 
