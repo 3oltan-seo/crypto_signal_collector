@@ -8,6 +8,24 @@
 python3 scanner.py
 ```
 
+   The scanner also reads currently open Bybit linear positions (read-only) using your `.env` credentials and marks each generated signal row against your active exposure:
+
+   - `signal_state = NEW_SIGNAL` — no open position for the symbol, consider normally.
+   - `signal_state = ACTIVE_SAME_SIDE` — same-side position already open; do not duplicate the entry, manage the existing position.
+   - `signal_state = CONFLICT_WITH_ACTIVE_POSITION` — opposite-side position is open (or both sides somehow). Review the existing position before considering the new signal.
+   - `signal_state = EXPOSURE_UNKNOWN` — Bybit position data was unavailable (missing credentials, auth/API error). Signal rows are still produced, but exposure is not confirmed.
+
+   Conflicting rows are NOT removed from `scanner_results.xlsx`; they are kept and marked so you can review them. The scanner never places, cancels, or modifies orders.
+
+   Before the table, the terminal prints an exposure summary, for example:
+
+   ```text
+   Active exposure: 3 positions
+   Active same-side signal rows: 2
+   Conflicts with active positions: 1
+     SOLUSDT: active short, new long signal -> review existing position
+   ```
+
 2. Open `scanner_results.xlsx`.
 3. Put `yes` in `selected` for signals where you placed limit orders.
 4. Optionally write a note in `manual_comment`.
@@ -55,7 +73,7 @@ This creates `trade_episodes.csv`, where one row means one scanner trading idea,
 
 ## Files
 
-- `scanner.py` — creates current long/short signals, appends all signals to `signals_log.csv`, and writes `scanner_results.xlsx`.
+- `scanner.py` — creates current long/short signals, appends all signals to `signals_log.csv`, and writes `scanner_results.xlsx`. Each signal row also includes active-exposure columns derived from a read-only Bybit `get_positions` call: `signal_state`, `active_position_side`, `active_position_size`, `active_position_entry`, `active_position_unrealised_pnl`, `active_position_age_days`, `active_exposure_note`, `action_hint`. When credentials are missing or the API call fails, the scanner still produces signals but sets `signal_state = EXPOSURE_UNKNOWN` and prints a warning.
 - `sync_selected_signals.py` — saves rows marked `selected=yes` into `selected_signals.csv`.
 - `check_stale_positions.py` — read-only check of current open Bybit linear positions; classifies each by age and matches against scanner signals. Never closes orders. Saves `stale_positions.csv`.
 - `sync_bybit_trades.py` — pulls closed PnL from Bybit, matches trades to signals, and enriches `trades_log.csv`.

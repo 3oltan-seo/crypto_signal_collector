@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -11,6 +12,11 @@ import pandas as pd
 from tabulate import tabulate
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, PatternFill
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 
 session = HTTP(testnet=False)
@@ -46,6 +52,275 @@ MARKET_REGIME_LOG = "market_regime_log.csv"
 
 def is_yes(value):
     return str(value).strip().lower() in {"yes", "y", "1", "true", "да", "д"}
+
+
+def _fallback_load_dotenv(path=".env"):
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def _load_env():
+    if load_dotenv is not None:
+        load_dotenv()
+    else:
+        _fallback_load_dotenv()
+
+
+def _exposure_to_float(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _bybit_side_to_position_side(bybit_side):
+    s = str(bybit_side).strip().lower()
+    if s == "buy":
+        return "long"
+    if s == "sell":
+        return "short"
+    return s or ""
+
+
+def fetch_active_positions():
+    """Fetch open Bybit linear positions for exposure classification.
+
+    Returns a dict:
+        {
+            "ok": bool,
+            "error": str | None,
+            "by_symbol": { symbol: { "long": {...}|None, "short": {...}|None } },
+        }
+
+    Read-only: this only calls get_positions and never places/cancels/modifies
+    orders. If credentials are missing or API call fails, returns ok=False and
+    by_symbol={} so callers can mark exposure as unknown rather than crash.
+    """
+    result = {"ok": False, "error": None, "by_symbol": {}}
+
+    _load_env()
+    api_key = os.getenv("BYBIT_API_KEY")
+    api_secret = os.getenv("BYBIT_API_SECRET")
+    testnet = os.getenv("BYBIT_TESTNET", "false").strip().lower() == "true"
+
+    if not api_key or not api_secret:
+        result["error"] = "missing BYBIT_API_KEY / BYBIT_API_SECRET"
+        return result
+
+    try:
+        auth_session = HTTP(testnet=testnet, api_key=api_key, api_secret=api_secret)
+    except Exception as exc:
+        result["error"] = f"could not init authed HTTP: {exc}"
+        return result
+
+    by_symbol = {}
+    any_ok = False
+    errors = []
+
+    for settle in ("USDT", "USDC"):
+        cursor = ""
+        while True:
+            kwargs = {"category": "linear", "settleCoin": settle, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            try:
+                response = auth_session.get_positions(**kwargs)
+            except Exception as exc:
+                errors.append(f"{settle}: {exc}")
+                break
+
+            ret_code = response.get("retCode")
+            ret_msg = response.get("retMsg") or ""
+            if ret_code not in (0, None):
+                errors.append(f"{settle}: retCode={ret_code} retMsg={ret_msg}")
+                break
+
+            any_ok = True
+            page = response.get("result") or {}
+            items = page.get("list") or []
+            for item in items:
+                size = _exposure_to_float(item.get("size"))
+                if size is None or size == 0:
+                    continue
+                symbol = str(item.get("symbol") or "").strip()
+                if not symbol:
+                    continue
+                side = _bybit_side_to_position_side(item.get("side"))
+                if side not in {"long", "short"}:
+                    continue
+
+                entry = (
+                    _exposure_to_float(item.get("avgPrice"))
+                    or _exposure_to_float(item.get("entryPrice"))
+                )
+                unrealised = _exposure_to_float(item.get("unrealisedPnl"))
+
+                created_ms = (
+                    _exposure_to_float(item.get("createdTime"))
+                    or _exposure_to_float(item.get("createdAt"))
+                )
+                updated_ms = _exposure_to_float(item.get("updatedTime"))
+                age_days = None
+                if created_ms and created_ms > 0:
+                    age_seconds = time.time() - (created_ms / 1000.0)
+                    if age_seconds > 0:
+                        age_days = round(age_seconds / 86400.0, 2)
+
+                position_record = {
+                    "side": side,
+                    "size": size,
+                    "entry": entry,
+                    "unrealised_pnl": unrealised,
+                    "created_ms": created_ms,
+                    "updated_ms": updated_ms,
+                    "age_days": age_days,
+                }
+
+                bucket = by_symbol.setdefault(symbol, {"long": None, "short": None})
+                # If hedge mode gives two records for same side, keep the larger one.
+                existing = bucket.get(side)
+                if existing is None or (size > existing.get("size", 0)):
+                    bucket[side] = position_record
+
+            cursor = page.get("nextPageCursor") or ""
+            if not cursor:
+                break
+
+    if not any_ok:
+        result["error"] = "; ".join(errors) if errors else "no successful get_positions call"
+        return result
+
+    result["ok"] = True
+    if errors:
+        # partial success — keep going but record warning
+        result["error"] = "partial: " + "; ".join(errors)
+    result["by_symbol"] = by_symbol
+    return result
+
+
+EMPTY_EXPOSURE_ROW = {
+    "signal_state": "",
+    "active_position_side": "",
+    "active_position_size": "",
+    "active_position_entry": "",
+    "active_position_unrealised_pnl": "",
+    "active_position_age_days": "",
+    "active_exposure_note": "",
+    "action_hint": "",
+}
+
+EXPOSURE_COLUMNS = list(EMPTY_EXPOSURE_ROW.keys())
+
+
+def classify_exposure(symbol, side, positions_state):
+    """Classify exposure for one scanner signal row.
+
+    positions_state is the dict returned by fetch_active_positions(). When it
+    is not ok, all classification fields are left blank and signal_state is
+    EXPOSURE_UNKNOWN to make the missing data obvious.
+    """
+    row = dict(EMPTY_EXPOSURE_ROW)
+
+    side = str(side or "").strip().lower()
+
+    if positions_state is None or not positions_state.get("ok"):
+        row["signal_state"] = "EXPOSURE_UNKNOWN"
+        row["active_exposure_note"] = "Bybit position data unavailable"
+        row["action_hint"] = "check exposure manually before acting"
+        return row
+
+    bucket = (positions_state.get("by_symbol") or {}).get(symbol)
+    if not bucket or (bucket.get("long") is None and bucket.get("short") is None):
+        row["signal_state"] = "NEW_SIGNAL"
+        row["action_hint"] = "consider normally"
+        return row
+
+    long_pos = bucket.get("long")
+    short_pos = bucket.get("short")
+
+    # Both sides open: treat as conflict regardless of new signal side.
+    if long_pos is not None and short_pos is not None:
+        row["signal_state"] = "CONFLICT_WITH_ACTIVE_POSITION"
+        row["active_position_side"] = "both"
+        sizes = []
+        if long_pos.get("size") is not None:
+            sizes.append(f"long={long_pos['size']}")
+        if short_pos.get("size") is not None:
+            sizes.append(f"short={short_pos['size']}")
+        row["active_position_size"] = ", ".join(sizes)
+        entry_parts = []
+        if long_pos.get("entry") is not None:
+            entry_parts.append(f"long@{long_pos['entry']}")
+        if short_pos.get("entry") is not None:
+            entry_parts.append(f"short@{short_pos['entry']}")
+        row["active_position_entry"] = ", ".join(entry_parts)
+        pnl_parts = []
+        if long_pos.get("unrealised_pnl") is not None:
+            pnl_parts.append(f"long={long_pos['unrealised_pnl']}")
+        if short_pos.get("unrealised_pnl") is not None:
+            pnl_parts.append(f"short={short_pos['unrealised_pnl']}")
+        row["active_position_unrealised_pnl"] = ", ".join(pnl_parts)
+        age_parts = []
+        for label, pos in (("long", long_pos), ("short", short_pos)):
+            if pos.get("age_days") is not None:
+                age_parts.append(f"{label}={pos['age_days']}")
+        row["active_position_age_days"] = ", ".join(age_parts)
+        row["active_exposure_note"] = (
+            f"{symbol}: both long and short open — hedged/conflicted exposure"
+        )
+        row["action_hint"] = (
+            "review existing positions before opening anything new (conservative)"
+        )
+        return row
+
+    active = long_pos if long_pos is not None else short_pos
+    active_side = active.get("side")
+
+    row["active_position_side"] = active_side
+    if active.get("size") is not None:
+        row["active_position_size"] = active["size"]
+    if active.get("entry") is not None:
+        row["active_position_entry"] = active["entry"]
+    if active.get("unrealised_pnl") is not None:
+        row["active_position_unrealised_pnl"] = active["unrealised_pnl"]
+    if active.get("age_days") is not None:
+        row["active_position_age_days"] = active["age_days"]
+
+    if side == active_side:
+        row["signal_state"] = "ACTIVE_SAME_SIDE"
+        row["active_exposure_note"] = (
+            f"{symbol}: already active {active_side}, same as new signal"
+        )
+        row["action_hint"] = "manage existing position, do not duplicate entry"
+    else:
+        row["signal_state"] = "CONFLICT_WITH_ACTIVE_POSITION"
+        row["active_exposure_note"] = (
+            f"{symbol}: active {active_side}, new {side} signal -> review existing position"
+        )
+        row["action_hint"] = "review existing position before considering opposite entry"
+
+    return row
 
 
 def http_get_json(url, params=None):
@@ -1322,6 +1597,14 @@ def save_results(df):
             "smc_zone",
             "smc_reason",
             "reason",
+            "signal_state",
+            "active_position_side",
+            "active_position_size",
+            "active_position_entry",
+            "active_position_unrealised_pnl",
+            "active_position_age_days",
+            "active_exposure_note",
+            "action_hint",
         }
 
         integer_columns = {
@@ -1359,6 +1642,12 @@ def save_results(df):
                 ws.column_dimensions[col_letter].width = 26
             elif header == "selected":
                 ws.column_dimensions[col_letter].width = 12
+            elif header in {"active_exposure_note", "action_hint"}:
+                ws.column_dimensions[col_letter].width = 48
+            elif header == "signal_state":
+                ws.column_dimensions[col_letter].width = 28
+            elif header.startswith("active_position_"):
+                ws.column_dimensions[col_letter].width = 22
             else:
                 ws.column_dimensions[col_letter].width = 16
 
@@ -1401,6 +1690,26 @@ def main():
     print("")
 
     print_market_regime_context(market_context)
+
+    positions_state = fetch_active_positions()
+    if not positions_state.get("ok"):
+        print(
+            f"[warn] Bybit active-exposure check unavailable: "
+            f"{positions_state.get('error') or 'unknown error'}",
+            file=sys.stderr,
+        )
+        print(
+            "[warn] Signals will still be generated, but exposure fields "
+            "will be marked EXPOSURE_UNKNOWN. Verify exposure manually before "
+            "placing orders.",
+            file=sys.stderr,
+        )
+    elif positions_state.get("error"):
+        # partial success — log a softer warning
+        print(
+            f"[warn] Partial Bybit exposure data: {positions_state['error']}",
+            file=sys.stderr,
+        )
 
     tickers = get_ticker_map()
     candidates = build_candidates(tickers)
@@ -1472,7 +1781,45 @@ def main():
     df.insert(2, "manual_comment", "")
     df.insert(3, "created_at", created_at)
 
+    exposure_rows = [
+        classify_exposure(row["symbol"], row["side"], positions_state)
+        for _, row in df.iterrows()
+    ]
+    for col in EXPOSURE_COLUMNS:
+        df[col] = [er.get(col, "") for er in exposure_rows]
+
+    by_symbol = (positions_state.get("by_symbol") or {}) if positions_state.get("ok") else {}
+    active_count = 0
+    for bucket in by_symbol.values():
+        if bucket.get("long") is not None:
+            active_count += 1
+        if bucket.get("short") is not None:
+            active_count += 1
+
+    same_side_rows = [er for er in exposure_rows if er["signal_state"] == "ACTIVE_SAME_SIDE"]
+    conflict_rows = [
+        (df.iloc[i], er)
+        for i, er in enumerate(exposure_rows)
+        if er["signal_state"] == "CONFLICT_WITH_ACTIVE_POSITION"
+    ]
+
     print("")
+    if positions_state.get("ok"):
+        print(f"Active exposure: {active_count} positions")
+    else:
+        print("Active exposure: unknown (Bybit position data unavailable)")
+    print(f"Active same-side signal rows: {len(same_side_rows)}")
+    print(f"Conflicts with active positions: {len(conflict_rows)}")
+    for signal_row, exp in conflict_rows:
+        active_side = exp.get("active_position_side") or "?"
+        new_side = str(signal_row.get("side") or "?").lower()
+        sym = signal_row.get("symbol", "?")
+        print(
+            f"  {sym}: active {active_side}, new {new_side} signal "
+            f"-> review existing position"
+        )
+    print("")
+
     print(tabulate(df, headers="keys", tablefmt="github", showindex=False))
 
     append_signals_log(df)
